@@ -544,11 +544,39 @@ This is important because a pair can have a good full-sample correlation but fai
 
 The dashboard also constructs a beta-adjusted price spread.
 
-The formula is approximately:
+The formula is:
 
 ```text
-spread = log(target price) - intercept - beta x log(hedge price)
+spread = log(target price) - price alpha / intercept - price beta x log(hedge price)
 ```
+
+`price beta` and `price alpha / intercept` are estimated jointly by OLS regression over the full calibration sample:
+
+```text
+log(target price) = price alpha / intercept + price beta x log(hedge price) + residual
+```
+
+The intercept (alpha) is the constant level adjustment that centres the spread at zero when the two prices are at their calibrated fair-value relationship. It is calculated as:
+
+```text
+price alpha = mean(log target) - price beta x mean(log hedge)
+```
+
+Both parameters are fixed for the loaded calibration sample and appear in:
+
+- the **ranked proxy hedge candidates table** (`price beta` and `price alpha / intercept` columns)
+- the **calibration parameters table** in the rolling spread statistics section
+- the **spread formula** displayed for each selected pair: `ln(target) - alpha - price beta x ln(hedge)`
+- the **chart titles** of the z-score chart and rolling spread chart
+
+For a Bloomberg live monitor, the calibrated alpha and price beta allow you to reconstruct the residual spread from live prices:
+
+```text
+live spread = LN(live target) - price alpha - price beta x LN(live hedge)
+z-score = (live spread - rolling mean) / rolling std dev
+```
+
+Alpha is **not** recalculated bar-by-bar. It is a fixed calibration parameter estimated jointly with price beta from the historical sample. The series `LN(target) - price beta x LN(hedge)` equals alpha plus the residual, not alpha alone.
 
 For example:
 
@@ -614,7 +642,23 @@ If the spread is stretched against you, the hedge may still reduce directional r
 
 ## 12A. Rolling Spread Mean And Standard Deviation
 
-The dashboard also displays the rolling inputs used to calculate the z-score:
+The dashboard also displays the rolling inputs used to calculate the z-score.
+
+A **calibration parameters table** is shown first, containing:
+
+```text
+target
+hedge
+calibration observations
+calibration start / end
+price beta
+price alpha / intercept
+spread formula: ln(target) - alpha - price beta x ln(hedge)
+```
+
+These values are fixed for the loaded price sample and are the parameters required to replicate the spread in a live Bloomberg implementation.
+
+Below that, a **latest-value table** shows:
 
 ```text
 spread level
