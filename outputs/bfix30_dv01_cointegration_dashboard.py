@@ -80,6 +80,8 @@ class PairStats:
     full_corr: float
     beta: float
     intercept: float
+    price_beta: float
+    price_intercept: float
     beta_method: str
     beta_se: float
     beta_tstat: float
@@ -650,6 +652,8 @@ def bfix30_pair_stats(
         full_corr=float(full_corr),
         beta=float(beta),
         intercept=float(ret_intercept),
+        price_beta=float(price_beta) if np.isfinite(price_beta) else np.nan,
+        price_intercept=float(price_intercept) if np.isfinite(price_intercept) else np.nan,
         beta_method=str(beta_method).lower(),
         beta_se=float(beta_se) if np.isfinite(beta_se) else np.nan,
         beta_tstat=float(beta_tstat) if np.isfinite(beta_tstat) else np.nan,
@@ -1283,6 +1287,8 @@ def bfix30_format_hedge_table(table):
         "beta_se",
         "beta_tstat",
         "gls_rho",
+        "price_beta",
+        "price_intercept",
         "spread_z",
         "half_life_bars",
         "coint_pvalue",
@@ -1316,6 +1322,8 @@ def bfix30_format_hedge_table(table):
             "beta_tstat": "beta t-stat",
             "gls_rho": "GLS rho",
             "hac_lags": "NW lags",
+            "price_beta": "price beta",
+            "price_intercept": "price alpha / intercept",
             "spread_z": "spread z",
             "half_life_bars": "half-life bars",
             "coint_pvalue": "coint p",
@@ -1583,6 +1591,8 @@ def bfix30_update_pair_table(*_):
             "beta_tstat",
             "gls_rho",
             "hac_lags",
+            "price_beta",
+            "price_intercept",
             "spread_z",
             "half_life_bars",
             "coint_pvalue",
@@ -1755,7 +1765,7 @@ def bfix30_update_spread_chart(*_):
             )
             return
 
-        spread_z, price_beta, _ = bfix30_pair_spread_zscore(
+        spread_z, price_beta, price_intercept = bfix30_pair_spread_zscore(
             prices=bfix30_panel.prices,
             target=target,
             hedge=hedge,
@@ -1783,8 +1793,8 @@ def bfix30_update_spread_chart(*_):
         figure.update_layout(
             title=(
                 f"Cointegration spread z-score: {target} minus beta x {hedge} "
-                f"| beta={price_beta:.3f}, coint p={stats.coint_pvalue:.4f}, "
-                f"ADF p={stats.adf_pvalue:.4f}"
+                f"| price beta={price_beta:.4f}, price alpha={price_intercept:.4f}, "
+                f"coint p={stats.coint_pvalue:.4f}, ADF p={stats.adf_pvalue:.4f}"
             ),
             height=420,
             margin=dict(l=60, r=30, t=70, b=55),
@@ -1805,7 +1815,7 @@ def bfix30_update_spread_stats(*_):
             print("Reload BFIX data to display rolling spread statistics.")
             return
 
-        levels, price_beta, _ = bfix30_pair_spread_levels(
+        levels, price_beta, price_intercept = bfix30_pair_spread_levels(
             prices=bfix30_panel.prices,
             target=target,
             hedge=hedge,
@@ -1827,6 +1837,33 @@ def bfix30_update_spread_stats(*_):
             return
 
         latest = usable.iloc[-1]
+
+        calib_obs = len(levels.dropna(subset=["spread_level"]))
+        calib_start = levels.dropna(subset=["spread_level"]).index.min()
+        calib_end = levels.dropna(subset=["spread_level"]).index.max()
+        price_beta_fmt = f"{price_beta:.6f}" if np.isfinite(price_beta) else "n/a"
+        price_intercept_fmt = (
+            f"{price_intercept:.6f}" if np.isfinite(price_intercept) else "n/a"
+        )
+        formula_str = (
+            f"ln({target}) - {price_intercept_fmt} - {price_beta_fmt} x ln({hedge})"
+        )
+        calib_table = pd.DataFrame(
+            [
+                {
+                    "target": target,
+                    "hedge": hedge,
+                    "calib obs": calib_obs,
+                    "calib start": calib_start.strftime("%Y-%m-%d %H:%M"),
+                    "calib end": calib_end.strftime("%Y-%m-%d %H:%M"),
+                    "price beta": price_beta_fmt,
+                    "price alpha / intercept": price_intercept_fmt,
+                    "spread formula": formula_str,
+                }
+            ]
+        )
+        display(calib_table)
+
         latest_table = pd.DataFrame(
             [
                 {
@@ -1906,7 +1943,8 @@ def bfix30_update_spread_stats(*_):
         figure.update_layout(
             title=(
                 f"Rolling spread mean and standard deviation: {target} versus {hedge} "
-                f"({z_window} bars, price beta={price_beta:.4f})"
+                f"({z_window} bars, price beta={price_beta:.4f}, "
+                f"price alpha={price_intercept:.4f})"
             ),
             height=460,
             margin=dict(l=60, r=65, t=70, b=55),
