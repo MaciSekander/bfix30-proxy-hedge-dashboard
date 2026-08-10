@@ -51,6 +51,7 @@ BFIX30_CURRENCIES = {
     "NZD": "NZD",
     "NOK": "NOK",
     "SEK": "SEK",
+    "XAU": "XAU",
 }
 
 BFIX30_SLOTS = [
@@ -74,6 +75,7 @@ class BFIXPanel:
 class PairStats:
     target: str
     hedge: str
+    feature_2: str
     observations: int
     target_notional: float
     latest_corr: float
@@ -81,6 +83,7 @@ class PairStats:
     beta: float
     intercept: float
     price_beta: float
+    feature_2_price_beta: float
     price_intercept: float
     beta_method: str
     beta_se: float
@@ -564,6 +567,57 @@ def bfix30_safe_adf_pvalue(spread):
             return np.nan
 
 
+def bfix30_normalize_feature_2(feature_2, target=None, hedge=None):
+    if feature_2 is None:
+        return None
+    feature_2 = str(feature_2).strip()
+    if not feature_2:
+        return None
+    if feature_2 in {target, hedge}:
+        return None
+    return feature_2
+
+
+def bfix30_spread_required_columns(target, hedge, feature_2=None):
+    required = [target, hedge]
+    feature_2 = bfix30_normalize_feature_2(feature_2, target=target, hedge=hedge)
+    if feature_2 is not None:
+        required.append(feature_2)
+    return required
+
+
+def bfix30_spread_term(label, coefficient, precision):
+    if not np.isfinite(coefficient):
+        return ""
+    sign = "-" if coefficient >= 0 else "+"
+    return f" {sign} {abs(float(coefficient)):.{precision}f} x ln({label})"
+
+
+def bfix30_spread_constant(value, precision):
+    if not np.isfinite(value):
+        return ""
+    sign = "-" if value >= 0 else "+"
+    return f" {sign} {abs(float(value)):.{precision}f}"
+
+
+def bfix30_spread_formula(
+    target,
+    hedge,
+    price_intercept,
+    price_beta,
+    feature_2=None,
+    feature_2_price_beta=np.nan,
+    precision=6,
+):
+    formula = f"ln({target})"
+    formula += bfix30_spread_constant(price_intercept, precision)
+    formula += bfix30_spread_term(hedge, price_beta, precision)
+    feature_2 = bfix30_normalize_feature_2(feature_2, target=target, hedge=hedge)
+    if feature_2 is not None:
+        formula += bfix30_spread_term(feature_2, feature_2_price_beta, precision)
+    return formula
+
+
 def bfix30_pair_stats(
     prices,
     returns,
@@ -574,18 +628,23 @@ def bfix30_pair_stats(
     target_notional,
     beta_method="ols",
     hac_lags=4,
+    feature_2=None,
 ):
     if target == hedge:
         return None
 
-    required = [target, hedge]
-    missing_returns = [column for column in required if column not in returns.columns]
-    missing_prices = [column for column in required if column not in prices.columns]
+    feature_2 = bfix30_normalize_feature_2(feature_2, target=target, hedge=hedge)
+    required_returns = [target, hedge]
+    required_prices = bfix30_spread_required_columns(target, hedge, feature_2)
+    missing_returns = [
+        column for column in required_returns if column not in returns.columns
+    ]
+    missing_prices = [column for column in required_prices if column not in prices.columns]
 
     if missing_returns or missing_prices:
         return None
 
-    paired_returns = returns.reindex(columns=required).dropna()
+    paired_returns = returns.reindex(columns=required_returns).dropna()
     observations = len(paired_returns)
 
     if observations < max(10, min(rolling_window, 30)):
@@ -605,23 +664,27 @@ def bfix30_pair_stats(
         hac_lags=hac_lags,
     )
 
-    paired_prices = prices.reindex(columns=required).dropna()
-    if len(paired_prices) < 30:
+    levels, price_beta, price_intercept, feature_2_price_beta = (
+        bfix30_pair_spread_levels(
+            prices=prices,
+            target=target,
+            hedge=hedge,
+            z_window=z_window,
+            feature_2=feature_2,
+        )
+    )
+    if levels.empty:
         return None
 
+    paired_prices = prices.reindex(columns=required_prices).dropna()
     log_target = np.log(paired_prices[target].astype(float))
     log_hedge = np.log(paired_prices[hedge].astype(float))
-    price_beta, price_intercept = bfix30_ols_beta(log_target, log_hedge)
+    spread = levels["spread_level"].dropna()
 
-    if np.isfinite(price_beta):
-        spread = log_target - price_intercept - price_beta * log_hedge
-    else:
-        spread = log_target - log_hedge
-
-    spread_window = spread.dropna().tail(z_window)
+    spread_window = spread.tail(z_window)
     spread_mean = float(spread_window.mean()) if len(spread_window) else np.nan
     spread_std = float(spread_window.std()) if len(spread_window) > 1 else np.nan
-    spread_last = float(spread.dropna().iloc[-1]) if len(spread.dropna()) else np.nan
+    spread_last = float(spread.iloc[-1]) if len(spread) else np.nan
     spread_z = (
         (spread_last - spread_mean) / spread_std
         if np.isfinite(spread_std) and spread_std > 0
@@ -646,6 +709,7 @@ def bfix30_pair_stats(
     return PairStats(
         target=target,
         hedge=hedge,
+        feature_2=feature_2 or "",
         observations=observations,
         target_notional=target_notional,
         latest_corr=float(latest_corr_value),
@@ -653,6 +717,9 @@ def bfix30_pair_stats(
         beta=float(beta),
         intercept=float(ret_intercept),
         price_beta=float(price_beta) if np.isfinite(price_beta) else np.nan,
+        feature_2_price_beta=(
+            float(feature_2_price_beta) if np.isfinite(feature_2_price_beta) else np.nan
+        ),
         price_intercept=float(price_intercept) if np.isfinite(price_intercept) else np.nan,
         beta_method=str(beta_method).lower(),
         beta_se=float(beta_se) if np.isfinite(beta_se) else np.nan,
@@ -784,24 +851,47 @@ def bfix30_backtest_pair(returns, target, hedge, target_notional, beta):
     return summary, path
 
 
-def bfix30_pair_spread_levels(prices, target, hedge, z_window):
-    required = [target, hedge]
+def bfix30_pair_spread_levels(prices, target, hedge, z_window, feature_2=None):
+    feature_2 = bfix30_normalize_feature_2(feature_2, target=target, hedge=hedge)
+    required = bfix30_spread_required_columns(target, hedge, feature_2)
     missing = [column for column in required if column not in prices.columns]
     if missing or target == hedge:
-        return pd.DataFrame(), np.nan, np.nan
+        return pd.DataFrame(), np.nan, np.nan, np.nan
 
     paired_prices = prices.reindex(columns=required).dropna()
-    if len(paired_prices) < max(30, z_window // 4):
-        return pd.DataFrame(), np.nan, np.nan
+    min_observations = max(30, z_window // 4, len(required) + 3)
+    if len(paired_prices) < min_observations:
+        return pd.DataFrame(), np.nan, np.nan, np.nan
 
-    log_target = np.log(paired_prices[target].astype(float))
-    log_hedge = np.log(paired_prices[hedge].astype(float))
-    price_beta, price_intercept = bfix30_ols_beta(log_target, log_hedge)
+    log_prices = np.log(paired_prices.astype(float))
+    feature_labels = required[1:]
+    design = np.column_stack(
+        [
+            np.ones(len(log_prices)),
+            log_prices.loc[:, feature_labels].to_numpy(),
+        ]
+    )
+    if np.linalg.matrix_rank(design) < design.shape[1]:
+        return pd.DataFrame(), np.nan, np.nan, np.nan
 
-    if np.isfinite(price_beta):
-        spread = log_target - price_intercept - price_beta * log_hedge
-    else:
-        spread = log_target - log_hedge
+    try:
+        coefficients = np.linalg.lstsq(
+            design,
+            log_prices[target].to_numpy(),
+            rcond=None,
+        )[0]
+    except (np.linalg.LinAlgError, ValueError, FloatingPointError):
+        return pd.DataFrame(), np.nan, np.nan, np.nan
+    price_intercept = float(coefficients[0])
+    price_beta = float(coefficients[1]) if len(coefficients) > 1 else np.nan
+    feature_2_price_beta = (
+        float(coefficients[2])
+        if feature_2 is not None and len(coefficients) > 2
+        else np.nan
+    )
+    spread = log_prices[target] - price_intercept
+    for label, coefficient in zip(feature_labels, coefficients[1:]):
+        spread = spread - float(coefficient) * log_prices[label]
 
     min_periods = max(30, z_window // 4)
     rolling_mean = spread.rolling(z_window, min_periods=min_periods).mean()
@@ -817,19 +907,32 @@ def bfix30_pair_spread_levels(prices, target, hedge, z_window):
         },
         index=paired_prices.index,
     )
-    return levels.replace([np.inf, -np.inf], np.nan), price_beta, price_intercept
+    return (
+        levels.replace([np.inf, -np.inf], np.nan),
+        price_beta,
+        price_intercept,
+        feature_2_price_beta,
+    )
 
 
-def bfix30_pair_spread_zscore(prices, target, hedge, z_window):
-    levels, price_beta, price_intercept = bfix30_pair_spread_levels(
-        prices=prices,
-        target=target,
-        hedge=hedge,
-        z_window=z_window,
+def bfix30_pair_spread_zscore(prices, target, hedge, z_window, feature_2=None):
+    levels, price_beta, price_intercept, feature_2_price_beta = (
+        bfix30_pair_spread_levels(
+            prices=prices,
+            target=target,
+            hedge=hedge,
+            z_window=z_window,
+            feature_2=feature_2,
+        )
     )
     if levels.empty:
-        return pd.Series(dtype=float), price_beta, price_intercept
-    return levels["spread_z"].dropna(), price_beta, price_intercept
+        return pd.Series(dtype=float), price_beta, price_intercept, feature_2_price_beta
+    return (
+        levels["spread_z"].dropna(),
+        price_beta,
+        price_intercept,
+        feature_2_price_beta,
+    )
 
 
 def bfix30_zscore_signal_positions(
@@ -1084,6 +1187,20 @@ bfix30_hedge_currency = widgets.Dropdown(
     options=bfix30_initial_selection,
     value="GBP",
     description="Hedge:",
+    layout=widgets.Layout(width="250px"),
+)
+
+bfix30_feature_2 = widgets.Dropdown(
+    options=[
+        ("None", ""),
+        *[
+            (instrument, instrument)
+            for instrument in bfix30_initial_selection
+            if instrument not in {"EUR", "GBP"}
+        ],
+    ],
+    value="",
+    description="Feature 2:",
     layout=widgets.Layout(width="250px"),
 )
 
@@ -1532,9 +1649,14 @@ def bfix30_current_pair_stats():
 
     target = bfix30_target_currency.value
     hedge = bfix30_hedge_currency.value
+    feature_2 = bfix30_normalize_feature_2(
+        bfix30_feature_2.value,
+        target=target,
+        hedge=hedge,
+    )
+    required_prices = bfix30_spread_required_columns(target, hedge, feature_2)
     if (
-        target not in bfix30_panel.prices.columns
-        or hedge not in bfix30_panel.prices.columns
+        any(column not in bfix30_panel.prices.columns for column in required_prices)
         or target not in bfix30_panel.returns.columns
         or hedge not in bfix30_panel.returns.columns
     ):
@@ -1550,6 +1672,7 @@ def bfix30_current_pair_stats():
         target_notional=bfix30_target_notional.value,
         beta_method=bfix30_beta_method.value,
         hac_lags=bfix30_hac_lags.value,
+        feature_2=feature_2,
     )
 
 
@@ -1746,13 +1869,21 @@ def bfix30_update_spread_chart(*_):
 
         target = bfix30_target_currency.value
         hedge = bfix30_hedge_currency.value
+        feature_2 = bfix30_normalize_feature_2(
+            bfix30_feature_2.value,
+            target=target,
+            hedge=hedge,
+        )
         stats = bfix30_current_pair_stats()
 
         if stats is None:
-            print("Load data and choose a valid target/hedge pair.")
+            print(
+                "Load data and choose a valid target/hedge relationship with "
+                "sufficient aligned observations."
+            )
             return
 
-        required = [target, hedge]
+        required = bfix30_spread_required_columns(target, hedge, feature_2)
         missing = [
             currency
             for currency in required
@@ -1765,16 +1896,31 @@ def bfix30_update_spread_chart(*_):
             )
             return
 
-        spread_z, price_beta, price_intercept = bfix30_pair_spread_zscore(
-            prices=bfix30_panel.prices,
-            target=target,
-            hedge=hedge,
-            z_window=bfix30_z_window_dropdown.value,
+        spread_z, price_beta, price_intercept, feature_2_price_beta = (
+            bfix30_pair_spread_zscore(
+                prices=bfix30_panel.prices,
+                target=target,
+                hedge=hedge,
+                z_window=bfix30_z_window_dropdown.value,
+                feature_2=feature_2,
+            )
         )
 
         if spread_z.empty:
-            print("Not enough price history to calculate the spread z-score.")
+            print(
+                "Not enough aligned price history to calculate the spread z-score."
+            )
             return
+
+        formula_str = bfix30_spread_formula(
+            target=target,
+            hedge=hedge,
+            price_intercept=price_intercept,
+            price_beta=price_beta,
+            feature_2=feature_2,
+            feature_2_price_beta=feature_2_price_beta,
+            precision=4,
+        )
 
         figure = go.Figure()
         figure.add_trace(
@@ -1792,8 +1938,8 @@ def bfix30_update_spread_chart(*_):
         figure.update_xaxes(title="Timestamp")
         figure.update_layout(
             title=(
-                f"Cointegration spread z-score: {target} minus beta x {hedge} "
-                f"| price beta={price_beta:.4f}, price alpha={price_intercept:.4f}, "
+                f"Cointegration spread z-score: {formula_str} "
+                f"| "
                 f"coint p={stats.coint_pvalue:.4f}, ADF p={stats.adf_pvalue:.4f}"
             ),
             height=420,
@@ -1809,21 +1955,32 @@ def bfix30_update_spread_stats(*_):
 
         target = bfix30_target_currency.value
         hedge = bfix30_hedge_currency.value
+        feature_2 = bfix30_normalize_feature_2(
+            bfix30_feature_2.value,
+            target=target,
+            hedge=hedge,
+        )
         z_window = bfix30_z_window_dropdown.value
 
         if bfix30_panel.prices.empty:
             print("Reload BFIX data to display rolling spread statistics.")
             return
 
-        levels, price_beta, price_intercept = bfix30_pair_spread_levels(
-            prices=bfix30_panel.prices,
-            target=target,
-            hedge=hedge,
-            z_window=z_window,
+        levels, price_beta, price_intercept, feature_2_price_beta = (
+            bfix30_pair_spread_levels(
+                prices=bfix30_panel.prices,
+                target=target,
+                hedge=hedge,
+                z_window=z_window,
+                feature_2=feature_2,
+            )
         )
 
         if levels.empty:
-            print("Not enough price history to calculate rolling spread statistics.")
+            print(
+                "Not enough aligned price history to calculate rolling spread "
+                "statistics."
+            )
             return
 
         usable = levels.dropna(
@@ -1842,26 +1999,37 @@ def bfix30_update_spread_stats(*_):
         calib_start = levels.dropna(subset=["spread_level"]).index.min()
         calib_end = levels.dropna(subset=["spread_level"]).index.max()
         price_beta_fmt = f"{price_beta:.6f}" if np.isfinite(price_beta) else "n/a"
+        feature_2_price_beta_fmt = (
+            f"{feature_2_price_beta:.6f}"
+            if np.isfinite(feature_2_price_beta)
+            else "n/a"
+        )
         price_intercept_fmt = (
             f"{price_intercept:.6f}" if np.isfinite(price_intercept) else "n/a"
         )
-        formula_str = (
-            f"ln({target}) - {price_intercept_fmt} - {price_beta_fmt} x ln({hedge})"
+        formula_str = bfix30_spread_formula(
+            target=target,
+            hedge=hedge,
+            price_intercept=price_intercept,
+            price_beta=price_beta,
+            feature_2=feature_2,
+            feature_2_price_beta=feature_2_price_beta,
+            precision=6,
         )
-        calib_table = pd.DataFrame(
-            [
-                {
-                    "target": target,
-                    "hedge": hedge,
-                    "calib obs": calib_obs,
-                    "calib start": calib_start.strftime("%Y-%m-%d %H:%M"),
-                    "calib end": calib_end.strftime("%Y-%m-%d %H:%M"),
-                    "price beta": price_beta_fmt,
-                    "price alpha / intercept": price_intercept_fmt,
-                    "spread formula": formula_str,
-                }
-            ]
-        )
+        calib_row = {
+            "target": target,
+            "hedge": hedge,
+            "calib obs": calib_obs,
+            "calib start": calib_start.strftime("%Y-%m-%d %H:%M"),
+            "calib end": calib_end.strftime("%Y-%m-%d %H:%M"),
+            "hedge price beta": price_beta_fmt,
+            "price alpha / intercept": price_intercept_fmt,
+            "spread formula": formula_str,
+        }
+        if feature_2 is not None:
+            calib_row["feature 2"] = feature_2
+            calib_row["feature 2 price beta"] = feature_2_price_beta_fmt
+        calib_table = pd.DataFrame([calib_row])
         display(calib_table)
 
         latest_table = pd.DataFrame(
@@ -1942,9 +2110,8 @@ def bfix30_update_spread_stats(*_):
         )
         figure.update_layout(
             title=(
-                f"Rolling spread mean and standard deviation: {target} versus {hedge} "
-                f"({z_window} bars, price beta={price_beta:.4f}, "
-                f"price alpha={price_intercept:.4f})"
+                f"Rolling spread mean and standard deviation: {formula_str} "
+                f"({z_window} bars)"
             ),
             height=460,
             margin=dict(l=60, r=65, t=70, b=55),
@@ -2142,6 +2309,23 @@ def bfix30_update_all_charts(*_):
 # 7. Reload and callback functions
 # ----------------------------------------------------------------------------
 
+def bfix30_refresh_feature_2_options(selected=None):
+    if selected is None:
+        selected = list(bfix30_matrix_currencies.value)
+
+    excluded = {bfix30_target_currency.value, bfix30_hedge_currency.value}
+    options = [("None", "")]
+    options.extend(
+        (instrument, instrument)
+        for instrument in selected
+        if instrument not in excluded
+    )
+    current = bfix30_feature_2.value
+    valid_values = {value for _, value in options}
+    bfix30_feature_2.options = options
+    bfix30_feature_2.value = current if current in valid_values else ""
+
+
 def bfix30_reload_history(*_):
     global bfix30_panel
 
@@ -2210,12 +2394,11 @@ def bfix30_on_currency_selection_change(change):
 
     if len(selected) < 2:
         return
-
     if bfix30_target_currency.value not in selected:
         bfix30_target_currency.value = selected[0]
     if bfix30_hedge_currency.value not in selected:
         bfix30_hedge_currency.value = selected[1]
-
+    bfix30_refresh_feature_2_options(selected)
     bfix30_reload_history()
 
 
@@ -2225,10 +2408,19 @@ bfix30_history_dropdown.observe(bfix30_reload_history, names="value")
 bfix30_return_method.observe(bfix30_reload_history, names="value")
 bfix30_fill_single_gap.observe(bfix30_reload_history, names="value")
 bfix30_winsor_slider.observe(bfix30_reload_history, names="value")
+bfix30_target_currency.observe(
+    lambda change: bfix30_refresh_feature_2_options(),
+    names="value",
+)
+bfix30_hedge_currency.observe(
+    lambda change: bfix30_refresh_feature_2_options(),
+    names="value",
+)
 
 for widget in [
     bfix30_target_currency,
     bfix30_hedge_currency,
+    bfix30_feature_2,
     bfix30_window_dropdown,
     bfix30_z_window_dropdown,
     bfix30_beta_method,
@@ -2266,6 +2458,7 @@ bfix30_pair_controls = widgets.VBox(
         widgets.HTML("<h3>2. Proxy hedge analytics</h3>"),
         bfix30_target_currency,
         bfix30_hedge_currency,
+        bfix30_feature_2,
         bfix30_window_dropdown,
         bfix30_z_window_dropdown,
         bfix30_beta_method,
@@ -2319,4 +2512,5 @@ display(bfix30_dashboard)
 
 
 # Initial request. Start with 20 days; increase after confirming request speed.
+bfix30_refresh_feature_2_options()
 bfix30_reload_history()
